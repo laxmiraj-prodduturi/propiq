@@ -1,0 +1,45 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# ── Node ──────────────────────────────────────────────────────────────────────
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# ── Environment & secrets ──────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── AWS / SSH credentials ──────────────────────────────────────────────────────
+*.pem
+scripts/.ec2-state
+
+# ── Real tenant documents (PII) ───────────────────────────────────────────────
+documents/leases/
+documents/shared/
+
+# ── Real property seed (contains real tenant emails & personal data) ──────────
+scripts/seed_properties.sql
+
+# ── AI / Vector DB ────────────────────────────────────────────────────────────
+ai_service/chroma_db/
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
