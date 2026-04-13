@@ -21,6 +21,9 @@ frontend/.vite/
 .env.*
 !.env.example
 
+# ── Dev scripts ───────────────────────────────────────────────────────────────
+dev-up.sh
+
 # ── AWS / SSH credentials ──────────────────────────────────────────────────────
 *.pem
 scripts/.ec2-state
@@ -38,6 +41,9 @@ ai_service/chroma_db/
 # ── OS ────────────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+
+# ── Claude Code local settings (may contain allowed-command history) ──────────
+.claude/
 
 # ── IDE ───────────────────────────────────────────────────────────────────────
 .idea/
