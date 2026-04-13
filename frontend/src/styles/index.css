@@ -249,10 +249,12 @@ input, textarea, select { font-family: var(--font); }
 }
 
 .nav-icon {
-  font-size: 16px;
   width: 20px;
-  text-align: center;
   flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: inherit;
 }
 
 .nav-badge {
@@ -1562,7 +1564,7 @@ input, textarea, select { font-family: var(--font); }
   color: var(--text-muted);
 }
 
-.empty-icon { font-size: 40px; margin-bottom: 12px; opacity: 0.5; }
+.empty-icon { display: flex; align-items: center; justify-content: center; margin-bottom: 12px; opacity: 0.4; color: var(--text-muted); }
 .empty-title { font-size: 15px; font-weight: 600; color: var(--text-secondary); margin-bottom: 4px; }
 .empty-desc { font-size: 13px; color: var(--text-muted); }
 
@@ -1652,6 +1654,75 @@ input, textarea, select { font-family: var(--font); }
   letter-spacing: 0.5px;
   margin-top: 2px;
 }
+
+/* ===== LIST ROW (dashboard cards) ===== */
+.list-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.list-row:last-child { border-bottom: none; }
+
+.list-row-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.list-row-sub {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.list-row-avatar {
+  width: 34px;
+  height: 34px;
+  border-radius: var(--radius-full);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.urgency-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+/* ===== SIDEBAR LOGOUT ===== */
+.sidebar-logout {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  opacity: 0.6;
+  transition: all var(--t-fast) var(--ease);
+}
+
+.sidebar-logout:hover {
+  opacity: 1;
+  color: var(--danger);
+  background: var(--danger-10);
+}
+
+/* ===== KPI icon SVG alignment ===== */
+.kpi-icon-wrap svg { display: block; }
 
 /* ===== ANIMATIONS ===== */
 @keyframes slideUp {

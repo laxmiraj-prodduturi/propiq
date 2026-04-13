@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { MOCK_PROPERTIES } from '../../data/mockData';
 import { createProperty, getProperties } from '../../api/properties';
 import type { Property, PropertyType, UnitStatus } from '../../types';
+import { Icon } from '../../components/Icons';
 
 const statusColor: Record<UnitStatus, string> = {
   occupied: 'var(--emerald)',
@@ -230,7 +231,7 @@ function PropertyCard({ property, onClick }: { property: Property; onClick: () =
     <div className="property-card" onClick={onClick}>
       <div className="property-banner" style={{ background: `linear-gradient(135deg, ${property.imageColor}33 0%, ${property.imageColor}15 100%)` }}>
         <div className="property-banner-pattern" />
-        <span className="property-banner-icon">🏡</span>
+        <span className="property-banner-icon" style={{ color: property.imageColor, opacity: 0.85 }}><Icon.home size={44} /></span>
         <div style={{ position: 'absolute', top: 12, right: 12 }}>
           <span className="badge badge-muted" style={{ fontSize: 10 }}>single family</span>
         </div>

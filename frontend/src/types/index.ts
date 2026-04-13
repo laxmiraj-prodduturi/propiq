@@ -1,3 +1,5 @@
+import type React from 'react';
+
 export type Role = 'owner' | 'manager' | 'tenant';
 
 export interface User {
@@ -123,6 +125,6 @@ export interface KPICard {
   value: string;
   change: string;
   changeType: 'up' | 'down' | 'neutral';
-  icon: string;
+  icon: React.ReactNode;
   color: string;
 }
