@@ -288,17 +288,24 @@ if [[ -f "$NGINX_LOG" ]]; then
   LAST_LINE=$(tail -1 "$NGINX_LOG" 2>/dev/null)
   if [[ -n "$LAST_LINE" ]]; then
     TS=$(echo "$LAST_LINE" | grep -oP '\[\K[^\]]+' | head -1)
-    if [[ -n "$TS" ]]; then
-      LAST_EPOCH=$(date -d "${TS%% *}" '+%s' 2>/dev/null || echo 0)
-      NOW_EPOCH=$(date '+%s')
-      IDLE_SECONDS=$(( NOW_EPOCH - LAST_EPOCH ))
-      IDLE_MINS=$(( IDLE_SECONDS / 60 ))
-      if [[ $IDLE_SECONDS -lt $(( IDLE_MINUTES * 60 )) ]]; then
-        log "Active — last request ${IDLE_MINS}m ago. No shutdown."
-        exit 0
-      fi
-      log "IDLE for ${IDLE_MINS}m (threshold: ${IDLE_MINUTES}m). Shutting down."
+    if [[ -z "$TS" ]]; then
+      log "Could not parse nginx log timestamp — skipping shutdown."; exit 0
     fi
+    # Convert nginx format "21/Apr/2026:19:30:00 +0000" to GNU date-parseable
+    # "21 Apr 2026 19:30:00 +0000" by replacing / with space and first : with space
+    PARSED_TS=$(echo "$TS" | sed 's|/| |g; s|:| |')
+    LAST_EPOCH=$(date -d "$PARSED_TS" '+%s' 2>/dev/null)
+    if [[ -z "$LAST_EPOCH" || "$LAST_EPOCH" -eq 0 ]]; then
+      log "Could not convert nginx timestamp '$TS' — skipping shutdown."; exit 0
+    fi
+    NOW_EPOCH=$(date '+%s')
+    IDLE_SECONDS=$(( NOW_EPOCH - LAST_EPOCH ))
+    IDLE_MINS=$(( IDLE_SECONDS / 60 ))
+    if [[ $IDLE_SECONDS -lt $(( IDLE_MINUTES * 60 )) ]]; then
+      log "Active — last request ${IDLE_MINS}m ago. No shutdown."
+      exit 0
+    fi
+    log "IDLE for ${IDLE_MINS}m (threshold: ${IDLE_MINUTES}m). Shutting down."
   else
     # Use /proc/uptime (seconds since boot) to avoid unit mismatch with
     # ActiveEnterTimestampMonotonic (microseconds) vs date +%s (Unix epoch)
