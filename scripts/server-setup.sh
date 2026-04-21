@@ -300,9 +300,10 @@ if [[ -f "$NGINX_LOG" ]]; then
       log "IDLE for ${IDLE_MINS}m (threshold: ${IDLE_MINUTES}m). Shutting down."
     fi
   else
-    NGINX_EPOCH=$(systemctl show nginx --property=ActiveEnterTimestampMonotonic --value 2>/dev/null || echo 0)
-    NOW_EPOCH=$(date '+%s')
-    UP_MINS=$(( (NOW_EPOCH - NGINX_EPOCH) / 60 ))
+    # Use /proc/uptime (seconds since boot) to avoid unit mismatch with
+    # ActiveEnterTimestampMonotonic (microseconds) vs date +%s (Unix epoch)
+    UPTIME_SECS=$(awk '{print int($1)}' /proc/uptime)
+    UP_MINS=$(( UPTIME_SECS / 60 ))
     if [[ $UP_MINS -lt $IDLE_MINUTES ]]; then
       log "No requests yet — nginx up ${UP_MINS}m. Waiting."; exit 0
     fi

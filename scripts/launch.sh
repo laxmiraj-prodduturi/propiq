@@ -206,10 +206,11 @@ aws ec2 create-tags \
   --region "$REGION" 2>/dev/null || true
 
 # Schedule auto-stop via SSM Run Command (runs in 5 hours)
+# Clear any stale at jobs first — leftover jobs from a previous run fire immediately on reboot
 aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
   --document-name "AWS-RunShellScript" \
-  --parameters "commands=[\"echo 'sudo shutdown -h now' | at now + 5 hours\"]" \
+  --parameters "commands=[\"atq | awk '{print \$1}' | xargs -r atrm\", \"echo 'sudo shutdown -h now' | at now + 5 hours\"]" \
   --region "$REGION" \
   --output text >/dev/null 2>/dev/null || warn "SSM auto-stop scheduling skipped (SSM agent may not be ready yet; set manually if needed)"
 
