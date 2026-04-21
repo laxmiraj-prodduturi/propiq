@@ -6,17 +6,9 @@ from ..config import settings
 
 logger = logging.getLogger(__name__)
 
-_INTENT_SYSTEM_PROMPT = """\
-You are an intent classifier for a residential property management AI assistant.
-Classify the user message into exactly one of these intents:
+from .intent_registry import INTENT_NAMES, build_classifier_prompt, keyword_fallback
 
-- portfolio_summary: questions about overall property portfolio, vacancies, occupancy, portfolio overview, rent summary
-- maintenance_workflow: maintenance requests, repairs, work orders, property issues, follow-up plans
-- payment_workflow: rent payments, payment history, rent due dates, late fees, payment status
-- document_lookup: lease terms, policies, pet policy, lease documents, notices, what my lease says
-- general_qa: any other question
-
-Respond with ONLY the intent name — no explanation, no punctuation."""
+_INTENT_SYSTEM_PROMPT = build_classifier_prompt()
 
 _SYSTEM_PROMPT_TEMPLATE = """\
 You are a helpful AI assistant for a residential property management platform.
@@ -47,13 +39,8 @@ def _openai_client():
 # Intent classification
 # ---------------------------------------------------------------------------
 
-_VALID_INTENTS = frozenset(
-    {"portfolio_summary", "maintenance_workflow", "payment_workflow", "document_lookup", "general_qa"}
-)
-
-
 def classify_intent(message: str, role: str) -> str:
-    """Classify user intent via LLM, falling back to keyword matching."""
+    """Send message to OpenAI for intent classification; fall back to keywords."""
     client = _openai_client()
     if client:
         try:
@@ -67,25 +54,13 @@ def classify_intent(message: str, role: str) -> str:
                 max_tokens=20,
             )
             intent = response.choices[0].message.content.strip().lower()
-            if intent in _VALID_INTENTS:
+            if intent in INTENT_NAMES:
                 return intent
+            logger.warning("OpenAI returned unknown intent %r — falling back to keywords", intent)
         except Exception as exc:
             logger.warning("Intent classification LLM call failed: %s", exc)
 
-    return _keyword_intent(message)
-
-
-def _keyword_intent(message: str) -> str:
-    lowered = message.lower()
-    if any(t in lowered for t in ("portfolio", "vacant", "vacancy", "report", "occupancy")):
-        return "portfolio_summary"
-    if "maintenance" in lowered or "repair" in lowered or "work order" in lowered:
-        return "maintenance_workflow"
-    if any(t in lowered for t in ("payment", "rent", "late fee", "due")):
-        return "payment_workflow"
-    if any(t in lowered for t in ("lease", "pet", "policy", "notice", "document")):
-        return "document_lookup"
-    return "general_qa"
+    return keyword_fallback(message)
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { approveAIAction, getAIChatHistory, resumeAIAction, sendAIChatMessage } from '../../api/ai';
 import { useAuth } from '../../context/AuthContext';
-import type { AIMessage, ActionCard } from '../../types';
+import type { AIDebugInfo, AIMessage, ActionCard } from '../../types';
 
 const SUGGESTIONS: Record<string, string[]> = {
   owner: [
@@ -32,6 +32,78 @@ function buildWelcomeMessage(): AIMessage {
 
 function formatTime(iso: string) {
   return new Date(iso).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+}
+
+function AgentStepsPanel({ info }: { info: AIDebugInfo }) {
+  const [open, setOpen] = useState(false);
+  const hasContent = info.intent || info.toolsCalled.length > 0 || info.citations.length > 0;
+  if (!hasContent) return null;
+
+  return (
+    <div style={{ marginTop: 8 }}>
+      <button
+        onClick={() => setOpen(v => !v)}
+        style={{
+          background: 'none',
+          border: 'none',
+          cursor: 'pointer',
+          color: 'var(--text-muted)',
+          fontSize: 11,
+          padding: 0,
+          display: 'flex',
+          alignItems: 'center',
+          gap: 4,
+        }}
+      >
+        <span style={{ transform: open ? 'rotate(90deg)' : 'none', display: 'inline-block', transition: 'transform 0.15s' }}>▶</span>
+        Agent steps
+      </button>
+      {open && (
+        <div
+          style={{
+            marginTop: 6,
+            padding: '10px 12px',
+            background: 'var(--surface-2, rgba(255,255,255,0.04))',
+            border: '1px solid var(--border-default)',
+            borderRadius: 8,
+            fontSize: 12,
+            color: 'var(--text-secondary)',
+            lineHeight: 1.7,
+          }}
+        >
+          {info.intent && (
+            <div><span style={{ color: 'var(--text-muted)' }}>Intent:</span> <span className="badge badge-primary" style={{ fontSize: 11 }}>{info.intent}</span></div>
+          )}
+          {info.toolsCalled.length > 0 && (
+            <div style={{ marginTop: 6 }}>
+              <span style={{ color: 'var(--text-muted)' }}>Tools called:</span>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 4 }}>
+                {info.toolsCalled.map(t => (
+                  <span key={t} className="badge badge-muted" style={{ fontSize: 11 }}>{t}</span>
+                ))}
+              </div>
+            </div>
+          )}
+          {info.citations.length > 0 && (
+            <div style={{ marginTop: 6 }}>
+              <span style={{ color: 'var(--text-muted)' }}>Sources:</span>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 4 }}>
+                {info.citations.map(c => (
+                  <span key={c} className="badge badge-cyan" style={{ fontSize: 11 }}>{c}</span>
+                ))}
+              </div>
+            </div>
+          )}
+          {info.steps.length > 0 && (
+            <div style={{ marginTop: 6 }}>
+              <span style={{ color: 'var(--text-muted)' }}>Steps:</span>{' '}
+              {info.steps.join(' → ')}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
 export default function AIChat() {
@@ -99,7 +171,6 @@ export default function AIChat() {
   };
 
   const handleActionCard = async (card: ActionCard, approved: boolean) => {
-    // Optimistically update the action card status
     setMessages(prev =>
       prev.map(message =>
         message.actionCard?.actionId === card.actionId
@@ -112,7 +183,6 @@ export default function AIChat() {
       await approveAIAction(card.actionId, approved);
 
       if (approved) {
-        // Resume the paused LangGraph to get the agent's follow-up response
         const resume = await resumeAIAction(card.actionId);
         setMessages(prev => [...prev, resume.message]);
       } else {
@@ -151,7 +221,7 @@ export default function AIChat() {
       <div className="page-header" style={{ marginBottom: 0 }}>
         <div>
           <h2>AI Assistant</h2>
-          <p>Backend-connected assistant with approval actions</p>
+          <p>LangGraph-powered assistant with tool use and approval actions</p>
         </div>
       </div>
 
@@ -172,7 +242,7 @@ export default function AIChat() {
               <div className={`chat-avatar ${msg.role === 'user' ? 'user-avatar' : 'ai'}`}>
                 {msg.role === 'user' ? (user?.avatarInitials ?? 'U') : 'Q'}
               </div>
-              <div>
+              <div style={{ flex: 1, minWidth: 0 }}>
                 <div className={`chat-bubble ${msg.role === 'user' ? 'user' : 'ai'}`}>
                   <span style={{ whiteSpace: 'pre-wrap' }}>{msg.content}</span>
                 </div>
@@ -202,9 +272,26 @@ export default function AIChat() {
                     )}
                   </div>
                 )}
+                {msg.role === 'assistant' && msg.debugInfo && (
+                  <AgentStepsPanel info={msg.debugInfo} />
+                )}
               </div>
             </div>
           ))}
+
+          {submitting && (
+            <div className="chat-message">
+              <div className="chat-avatar ai">Q</div>
+              <div className="chat-bubble ai">
+                <div className="typing-indicator">
+                  <div className="typing-dot" />
+                  <div className="typing-dot" />
+                  <div className="typing-dot" />
+                </div>
+              </div>
+            </div>
+          )}
+
           <div ref={messagesEnd} />
         </div>
       </div>
@@ -221,7 +308,7 @@ export default function AIChat() {
         />
         <div className="flex gap-2 justify-end mt-3">
           <button className="btn btn-primary" disabled={submitting || !input.trim()} onClick={() => void sendMessage(input)}>
-            {submitting ? 'Sending...' : 'Send'}
+            {submitting ? 'Thinking...' : 'Send'}
           </button>
         </div>
       </div>

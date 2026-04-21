@@ -16,6 +16,7 @@ from backend.app.models.lease import Lease  # type: ignore  # noqa: E402
 from backend.app.models.maintenance import MaintenanceRequest  # type: ignore  # noqa: E402
 from backend.app.models.payment import Payment  # type: ignore  # noqa: E402
 from backend.app.models.property import Property  # type: ignore  # noqa: E402
+from backend.app.models.user import User  # type: ignore  # noqa: E402
 
 
 @contextmanager
@@ -89,6 +90,49 @@ def maintenance_for_user(*, user_id: str, role: str, tenant_id: str) -> list[Mai
             else:
                 query = query.filter(Property.tenant_id == tenant_id)
             return query.order_by(MaintenanceRequest.created_at.desc()).all()
+    except Exception:
+        return []
+
+
+def tenants_for_user(*, user_id: str, role: str, tenant_id: str) -> list[User]:
+    """
+    Returns tenant-role users visible to the caller.
+    Owner: tenants whose active lease is on a property the owner owns.
+    Manager: all tenants in the same tenant_org.
+    Tenant: only themselves.
+    """
+    try:
+        with db_session() as db:
+            if role == "tenant":
+                user = db.query(User).filter(User.id == user_id).first()
+                return [user] if user else []
+            if role == "manager":
+                return (
+                    db.query(User)
+                    .filter(User.tenant_id == tenant_id, User.role == "tenant")
+                    .order_by(User.last_name.asc())
+                    .all()
+                )
+            # owner — tenants with active leases on owner's properties
+            owner_property_ids = [
+                p.id for p in db.query(Property).filter(Property.owner_id == user_id).all()
+            ]
+            if not owner_property_ids:
+                return []
+            tenant_user_ids = [
+                lease.tenant_user_id
+                for lease in db.query(Lease)
+                .filter(Lease.property_id.in_(owner_property_ids), Lease.status == "active")
+                .all()
+            ]
+            if not tenant_user_ids:
+                return []
+            return (
+                db.query(User)
+                .filter(User.id.in_(tenant_user_ids))
+                .order_by(User.last_name.asc())
+                .all()
+            )
     except Exception:
         return []
 

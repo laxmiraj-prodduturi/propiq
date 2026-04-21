@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from urllib import error, parse, request
 import uuid
 
@@ -12,6 +12,8 @@ from ..config import settings
 from ..database import get_db
 from ..deps import get_current_user
 from ..models.ai_session import AIApproval, AIMessage, AISession
+from ..models.lease import Lease
+from ..models.property import Property
 from ..models.user import User
 from ..schemas.ai import (
     AIActionCard,
@@ -108,27 +110,82 @@ def _load_messages(db: Session, session_id: str) -> list[AIMessageOut]:
     return result
 
 
-def _fallback_reply(message: str, user: User) -> tuple[str, AIActionCard | None]:
-    """Local fallback when the AI service is unreachable."""
+def _fallback_reply(message: str, user: User, db: Session) -> tuple[str, AIActionCard | None]:
+    """Local fallback when the AI service is unreachable — queries real DB for key intents."""
     text = message.strip().lower()
+
+    # Lease expiry queries — return real data from DB
+    if any(t in text for t in ("expir", "renew", "quarter", "ending soon", "lease end", "upcoming lease")):
+        try:
+            cutoff = date.today() + timedelta(days=90)
+            query = (
+                db.query(Lease, Property.name)
+                .join(Property, Lease.property_id == Property.id)
+                .filter(
+                    Lease.status == "active",
+                    Lease.end_date <= cutoff,
+                    Lease.end_date >= date.today(),
+                )
+            )
+            if user.role == "tenant":
+                query = query.filter(Lease.tenant_user_id == user.id)
+            elif user.role == "owner":
+                query = query.filter(Property.owner_id == user.id)
+            else:
+                query = query.filter(Property.tenant_id == user.tenant_id)
+
+            rows = query.order_by(Lease.end_date.asc()).all()
+            if not rows:
+                return ("No active leases are expiring in the next 90 days.", None)
+            lines = [
+                f"  • {lease.tenant_name} at {prop_name} — ends {lease.end_date}, ${lease.rent_amount:.0f}/mo"
+                for lease, prop_name in rows
+            ]
+            return (
+                f"{len(rows)} lease(s) expiring in the next 90 days:\n" + "\n".join(lines),
+                None,
+            )
+        except Exception:
+            return ("I can look up expiring leases — please ensure the backend is fully running.", None)
+
+    # Tenant directory — return real names + phones from DB
+    if any(t in text for t in ("tenant name", "tenant contact", "tenant phone", "phone number", "list tenant", "all tenant")):
+        if user.role not in {"owner", "manager"}:
+            return ("You can view your own contact details in your profile.", None)
+        try:
+            rows = (
+                db.query(User.first_name, User.last_name, User.phone, User.email)
+                .join(Property, Property.tenant_id == User.tenant_id)
+                .filter(User.role == "tenant", User.tenant_id == user.tenant_id)
+                .distinct()
+                .order_by(User.last_name.asc())
+                .all()
+            )
+            if not rows:
+                return ("No tenant records found.", None)
+            lines = [f"  • {r.first_name} {r.last_name} — {r.phone or '—'} — {r.email}" for r in rows]
+            return (f"{len(rows)} tenant(s):\n" + "\n".join(lines), None)
+        except Exception:
+            return ("Could not retrieve tenant list right now.", None)
+
     if "maintenance" in text and user.role in {"owner", "manager"}:
         action_id = f"act_{uuid.uuid4().hex[:10]}"
         return (
-            "I prioritized the open work orders and identified one item that should be approved before execution.",
+            "I identified open maintenance items that may need attention. Review and approve before dispatching vendors.",
             AIActionCard(
                 action_id=action_id,
                 type="approve_work_order",
-                title="Approve Emergency HVAC Dispatch",
-                description="Authorize vendor dispatch for Oak Ridge House at an estimated cost of $850.",
+                title="Review Open Maintenance",
+                description="Authorize review of open work orders before vendor dispatch.",
                 status="pending",
             ),
         )
     if "report" in text and user.role == "owner":
-        return ("Portfolio summary prepared: occupancy is stable, one payment is overdue, and one maintenance item requires approval.", None)
-    if "lease" in text:
-        return ("I can help with lease terms, renewals, and document questions.", None)
+        return ("Portfolio summary: check the Dashboard for current occupancy, overdue payments, and open maintenance.", None)
     if "payment" in text or "rent" in text:
-        return ("I can review payment status, identify overdue balances, and explain next steps.", None)
+        return ("I can review payment status and identify overdue balances. Make sure the AI service is running for full analysis.", None)
+    if "lease" in text:
+        return ("I can help with lease terms, renewals, and expiry tracking. Try asking 'which leases expire this quarter'.", None)
     return ("I can help with maintenance triage, lease questions, payment follow-up, and owner reporting.", None)
 
 
@@ -164,7 +221,7 @@ def chat(
         pass
 
     if assistant_msg is None:
-        reply_text, action_card = _fallback_reply(payload.message, current_user)
+        reply_text, action_card = _fallback_reply(payload.message, current_user, db)
         assistant_msg = AIMessageOut(
             id=f"msg_{uuid.uuid4().hex[:10]}",
             role="assistant",
@@ -253,11 +310,9 @@ def resume_action(
 ):
     approval = db.query(AIApproval).filter(
         AIApproval.action_id == action_id,
-        AIApproval.user_id == current_user.user_id if hasattr(current_user, "user_id") else AIApproval.user_id == current_user.id,
+        AIApproval.user_id == current_user.id,
     ).first()
-    # Lookup by user_id
-    approval = db.query(AIApproval).filter(AIApproval.action_id == action_id).first()
-    if not approval or approval.user_id != current_user.id:
+    if not approval:
         raise HTTPException(status_code=404, detail="Approval request not found")
 
     if approval.status == "pending":

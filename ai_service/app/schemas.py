@@ -17,12 +17,20 @@ class AIActionCard(BaseModel):
     status: Literal["pending", "approved", "rejected"]
 
 
+class AIDebugInfo(BaseModel):
+    intent: str = ""
+    tools_called: list[str] = Field(default_factory=list)
+    citations: list[str] = Field(default_factory=list)
+    steps: list[str] = Field(default_factory=list)
+
+
 class AIMessageOut(BaseModel):
     id: str
     role: Literal["user", "assistant", "system"]
     content: str
     created_at: datetime
     action_card: AIActionCard | None = None
+    debug_info: AIDebugInfo | None = None
 
 
 class AIChatResponse(BaseModel):

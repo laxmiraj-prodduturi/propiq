@@ -15,6 +15,16 @@ function mapActionCard(raw: any) {
   };
 }
 
+function mapDebugInfo(raw: any) {
+  if (!raw) return undefined;
+  return {
+    intent: raw.intent ?? '',
+    toolsCalled: raw.tools_called ?? [],
+    citations: raw.citations ?? [],
+    steps: raw.steps ?? [],
+  };
+}
+
 function mapMessage(raw: any): AIMessage {
   return {
     id: raw.id,
@@ -22,6 +32,7 @@ function mapMessage(raw: any): AIMessage {
     content: raw.content,
     createdAt: raw.created_at,
     actionCard: mapActionCard(raw.action_card),
+    debugInfo: mapDebugInfo(raw.debug_info),
   };
 }
 

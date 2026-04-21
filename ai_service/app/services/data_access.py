@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
-from ..backend_bridge import documents_for_user, leases_for_user, maintenance_for_user, payments_for_user, properties_for_user
+from ..backend_bridge import documents_for_user, leases_for_user, maintenance_for_user, payments_for_user, properties_for_user, tenants_for_user
 from ..schemas import RetrievedDocument, UserContext
 
 
@@ -190,6 +190,39 @@ def summarize_payments(payments: list[dict[str, object]], leases: list[dict[str,
     )
 
 
+def list_tenants(user: UserContext) -> list[dict[str, object]]:
+    users = tenants_for_user(user_id=user.user_id, role=user.role, tenant_id=user.tenant_id)
+    return [
+        {
+            "id": u.id,
+            "name": f"{u.first_name} {u.last_name}".strip(),
+            "email": u.email,
+            "phone": u.phone or "—",
+        }
+        for u in users
+    ]
+
+
+def summarize_tenants(tenants: list[dict[str, object]], role: str) -> str:
+    if not tenants:
+        return "No tenant records found in scope."
+    if role == "tenant":
+        t = tenants[0]
+        return f"Your contact on file: {t['name']}, {t['email']}, {t['phone']}."
+    lines = [f"  • {t['name']} — {t['phone']} — {t['email']}" for t in tenants]
+    return f"{len(tenants)} tenant(s):\n" + "\n".join(lines)
+
+
+def get_expiring_leases(user: UserContext, days: int = 90) -> list[dict[str, object]]:
+    all_leases = get_active_leases(user)
+    cutoff = (date.today() + timedelta(days=days)).isoformat()
+    today = date.today().isoformat()
+    return [
+        lease for lease in all_leases
+        if lease["end_date"] <= cutoff and lease["end_date"] >= today
+    ]
+
+
 def summarize_leases(leases: list[dict[str, object]]) -> str:
     if not leases:
         return "No active lease records were found in scope."
@@ -197,6 +230,20 @@ def summarize_leases(leases: list[dict[str, object]]) -> str:
     return (
         f"{len(leases)} active lease records found. "
         f"The earliest lease end date is {next_expiring['end_date']} for tenant {next_expiring['tenant_name']}."
+    )
+
+
+def summarize_expiring_leases(leases: list[dict[str, object]], days: int = 90) -> str:
+    if not leases:
+        return f"No active leases are expiring within the next {days} days."
+    sorted_leases = sorted(leases, key=lambda lease: lease["end_date"])
+    lines = [
+        f"  • {lease['tenant_name']} — ends {lease['end_date']}, rent ${float(lease['rent_amount']):.0f}/mo"
+        for lease in sorted_leases
+    ]
+    return (
+        f"{len(leases)} lease(s) expiring within the next {days} days:\n"
+        + "\n".join(lines)
     )
 
 

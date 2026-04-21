@@ -104,12 +104,20 @@ export interface Notification {
   createdAt: string;
 }
 
+export interface AIDebugInfo {
+  intent: string;
+  toolsCalled: string[];
+  citations: string[];
+  steps: string[];
+}
+
 export interface AIMessage {
   id: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
   createdAt: string;
   actionCard?: ActionCard;
+  debugInfo?: AIDebugInfo;
 }
 
 export interface ActionCard {

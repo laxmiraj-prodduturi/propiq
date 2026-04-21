@@ -6,17 +6,21 @@ from datetime import datetime, timezone
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 
-from .schemas import AIActionCard, AIMessageOut, ProposedAction, UserContext
+from .schemas import AIActionCard, AIDebugInfo, AIMessageOut, ProposedAction, UserContext
 from .services import tools
 from .services.data_access import (
     get_active_leases,
+    get_expiring_leases,
     get_open_maintenance,
     get_payment_history,
     list_properties,
+    list_tenants,
+    summarize_expiring_leases,
     summarize_leases,
     summarize_maintenance,
     summarize_payments,
     summarize_property_portfolio,
+    summarize_tenants,
 )
 from .services.openai_client import classify_intent, compose_answer
 from .services.rag import init_vector_store, retrieve_documents
@@ -63,77 +67,123 @@ def plan_node(state: AgentState) -> dict:
     return updates
 
 
-def tool_execution_node(state: AgentState) -> dict:
-    user = UserContext(user_id=state["user_id"], role=state["role"], tenant_id=state["tenant_id"])
-    intent = state["intent"]
-    new_tool_calls: list[dict] = []
-    structured: dict = {}
+# ---------------------------------------------------------------------------
+# Intent handlers — one function per intent
+# Adding a new intent = add a handler here + an entry in _INTENT_HANDLERS below
+# ---------------------------------------------------------------------------
 
-    if intent == "portfolio_summary":
-        properties = list_properties(user)
-        maintenance_items = get_open_maintenance(user)
-        payments = get_payment_history(user)
-        leases = get_active_leases(user)
-        filtered_props = tools.filter_records_by_query(
-            properties, state["user_message"], ["address", "city", "name", "status"]
-        )
-        prop_summary = summarize_property_portfolio(filtered_props)
-        maint_summary = summarize_maintenance(maintenance_items)
-        pay_summary = summarize_payments(payments, leases, state["role"])
-        structured["summary"] = " ".join([prop_summary, maint_summary, pay_summary])
-        new_tool_calls.extend([
+def _handle_portfolio_summary(state: AgentState, user: UserContext) -> tuple[dict, list[dict]]:
+    properties = list_properties(user)
+    maintenance_items = get_open_maintenance(user)
+    payments = get_payment_history(user)
+    leases = get_active_leases(user)
+    filtered_props = tools.filter_records_by_query(
+        properties, state["user_message"], ["address", "city", "name", "status"]
+    )
+    prop_summary = summarize_property_portfolio(filtered_props)
+    maint_summary = summarize_maintenance(maintenance_items)
+    pay_summary = summarize_payments(payments, leases, state["role"])
+    return (
+        {"summary": " ".join([prop_summary, maint_summary, pay_summary])},
+        [
             {"name": "list_properties", "input": {}, "output_summary": prop_summary},
             {"name": "get_open_maintenance", "input": {}, "output_summary": maint_summary},
             {"name": "get_payment_history", "input": {}, "output_summary": pay_summary},
-        ])
+        ],
+    )
 
-    elif intent == "payment_workflow":
-        leases = get_active_leases(user)
-        payments = get_payment_history(user)
-        filtered_pays = tools.filter_records_by_query(
-            payments, state["user_message"], ["property_name", "tenant_name", "status", "due_date"]
-        )
-        pay_summary = summarize_payments(filtered_pays, leases, state["role"])
-        lease_summary = summarize_leases(leases)
-        structured["summary"] = " ".join([pay_summary, lease_summary])
-        new_tool_calls.extend([
+
+def _handle_payment_workflow(state: AgentState, user: UserContext) -> tuple[dict, list[dict]]:
+    leases = get_active_leases(user)
+    payments = get_payment_history(user)
+    filtered_pays = tools.filter_records_by_query(
+        payments, state["user_message"], ["property_name", "tenant_name", "status", "due_date"]
+    )
+    pay_summary = summarize_payments(filtered_pays, leases, state["role"])
+    lease_summary = summarize_leases(leases)
+    return (
+        {"summary": " ".join([pay_summary, lease_summary])},
+        [
             {"name": "get_payment_history", "input": {"role": state["role"]}, "output_summary": pay_summary},
             {"name": "get_active_leases", "input": {}, "output_summary": lease_summary},
-        ])
+        ],
+    )
 
-    elif intent == "maintenance_workflow":
-        requests = get_open_maintenance(user)
-        properties = list_properties(user)
-        filtered_reqs = tools.filter_records_by_query(
-            requests, state["user_message"], ["property_name", "category", "description", "urgency", "status"]
-        )
-        maint_summary = summarize_maintenance(filtered_reqs)
-        prop_summary = summarize_property_portfolio(properties)
-        structured["summary"] = " ".join([maint_summary, prop_summary])
-        new_tool_calls.extend([
+
+def _handle_maintenance_workflow(state: AgentState, user: UserContext) -> tuple[dict, list[dict]]:
+    requests = get_open_maintenance(user)
+    properties = list_properties(user)
+    filtered_reqs = tools.filter_records_by_query(
+        requests, state["user_message"], ["property_name", "category", "description", "urgency", "status"]
+    )
+    maint_summary = summarize_maintenance(filtered_reqs)
+    prop_summary = summarize_property_portfolio(properties)
+    return (
+        {"summary": " ".join([maint_summary, prop_summary])},
+        [
             {"name": "get_open_maintenance", "input": {}, "output_summary": maint_summary},
             {"name": "list_properties", "input": {}, "output_summary": prop_summary},
-        ])
+        ],
+    )
 
-    else:  # document_lookup or general_qa
-        leases = get_active_leases(user)
-        doc_summary = " ".join(d.get("snippet", "") for d in state["retrieved_docs"])
-        lease_summary = summarize_leases(leases)
-        parts = [p for p in [doc_summary, lease_summary] if p]
-        structured["summary"] = " ".join(parts) if parts else "No matching records found."
-        if state["retrieved_docs"]:
-            new_tool_calls.append({
-                "name": "search_documents",
-                "input": {"query": state["user_message"]},
-                "output_summary": doc_summary,
-            })
-        if leases:
-            new_tool_calls.append({
-                "name": "get_active_leases",
-                "input": {},
-                "output_summary": lease_summary,
-            })
 
+def _handle_tenant_directory(state: AgentState, user: UserContext) -> tuple[dict, list[dict]]:
+    tenants = list_tenants(user)
+    tenant_summary = summarize_tenants(tenants, state["role"])
+    return (
+        {"summary": tenant_summary},
+        [{"name": "list_tenants", "input": {}, "output_summary": tenant_summary}],
+    )
+
+
+def _handle_lease_workflow(state: AgentState, user: UserContext) -> tuple[dict, list[dict]]:
+    msg_lower = state["user_message"].lower()
+    days = 30 if any(t in msg_lower for t in ("month", "30 day")) else 90
+    expiring = get_expiring_leases(user, days=days)
+    all_leases = get_active_leases(user)
+    expiry_summary = summarize_expiring_leases(expiring, days=days)
+    lease_summary = summarize_leases(all_leases)
+    return (
+        {"summary": "\n".join([expiry_summary, lease_summary])},
+        [
+            {"name": "get_expiring_leases", "input": {"days": days}, "output_summary": expiry_summary},
+            {"name": "get_active_leases", "input": {}, "output_summary": lease_summary},
+        ],
+    )
+
+
+def _handle_document_lookup(state: AgentState, user: UserContext) -> tuple[dict, list[dict]]:
+    leases = get_active_leases(user)
+    doc_summary = " ".join(d.get("snippet", "") for d in state["retrieved_docs"])
+    lease_summary = summarize_leases(leases)
+    parts = [p for p in [doc_summary, lease_summary] if p]
+    tool_calls: list[dict] = []
+    if state["retrieved_docs"]:
+        tool_calls.append({"name": "search_documents", "input": {"query": state["user_message"]}, "output_summary": doc_summary})
+    if leases:
+        tool_calls.append({"name": "get_active_leases", "input": {}, "output_summary": lease_summary})
+    return (
+        {"summary": " ".join(parts) if parts else "No matching records found."},
+        tool_calls,
+    )
+
+
+# Maps intent name → handler. Add one line here when adding a new intent.
+_INTENT_HANDLERS = {
+    "portfolio_summary":   _handle_portfolio_summary,
+    "payment_workflow":    _handle_payment_workflow,
+    "maintenance_workflow": _handle_maintenance_workflow,
+    "tenant_directory":    _handle_tenant_directory,
+    "lease_workflow":      _handle_lease_workflow,
+    "document_lookup":     _handle_document_lookup,
+    "general_qa":          _handle_document_lookup,  # same retrieval path
+}
+
+
+def tool_execution_node(state: AgentState) -> dict:
+    user = UserContext(user_id=state["user_id"], role=state["role"], tenant_id=state["tenant_id"])
+    handler = _INTENT_HANDLERS.get(state["intent"], _handle_document_lookup)
+    structured, new_tool_calls = handler(state, user)
     return {
         "structured_context": structured,
         "tool_calls": new_tool_calls,
@@ -304,10 +354,18 @@ def build_assistant_message(state: dict) -> AIMessageOut:
             status="pending",
         )
 
+    debug_info = AIDebugInfo(
+        intent=state.get("intent", ""),
+        tools_called=[c["name"] for c in state.get("tool_calls", [])],
+        citations=state.get("citations", []),
+        steps=state.get("debug_steps", []),
+    )
+
     return AIMessageOut(
         id=f"msg_{uuid.uuid4().hex[:10]}",
         role="assistant",
         content=state.get("final_response", ""),
         created_at=datetime.now(timezone.utc),
         action_card=action_card,
+        debug_info=debug_info,
     )
