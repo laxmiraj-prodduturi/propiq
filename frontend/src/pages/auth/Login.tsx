@@ -17,9 +17,9 @@ const DEMO_ACCOUNTS = [
 ];
 
 export default function Login() {
-  const [selectedRole, setSelectedRole] = useState<Role>('manager');
-  const [email, setEmail] = useState('sarah.chen@example.com');
-  const [password, setPassword] = useState('demo1234');
+  const [selectedRole, setSelectedRole] = useState<Role>('owner');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const { login } = useAuth();
@@ -36,8 +36,8 @@ export default function Login() {
     setLoading(true);
     setError('');
     try {
-      await login(email, password);
-      navigate(getDefaultAppPath(selectedRole));
+      const loggedInUser = await login(email, password);
+      navigate(getDefaultAppPath(loggedInUser.role));
     } catch (err: any) {
       setError(err.message ?? 'Login failed');
     } finally {
@@ -49,8 +49,8 @@ export default function Login() {
     setLoading(true);
     setError('');
     try {
-      await login(acc.email, 'demo1234');
-      navigate(getDefaultAppPath(acc.role));
+      const loggedInUser = await login(acc.email, 'demo1234');
+      navigate(getDefaultAppPath(loggedInUser.role));
     } catch (err: any) {
       setError(err.message ?? 'Login failed');
     } finally {

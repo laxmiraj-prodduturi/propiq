@@ -1,11 +1,10 @@
 import { createContext, useContext, useState, useEffect, ReactNode } from 'react';
 import type { User } from '../types';
-import { MOCK_USERS } from '../data/mockData';
 import { loginApi, getMeApi, logoutApi, refreshTokenApi } from '../api/auth';
 
 interface AuthContextType {
   user: User | null;
-  login: (emailOrRole: string, password?: string) => Promise<void>;
+  login: (emailOrRole: string, password?: string) => Promise<User>;
   logout: () => void;
   isAuthenticated: boolean;
 }
@@ -41,7 +40,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const login = async (emailOrRole: string, password?: string) => {
+  const login = async (emailOrRole: string, password?: string): Promise<User> => {
     // If called with just a role (demo quick-login), look up the email
     const isRole = ['owner', 'manager', 'tenant'].includes(emailOrRole) && !password;
     let email = emailOrRole;
@@ -56,18 +55,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       email = roleToEmail[emailOrRole];
     }
 
-    try {
-      const { token, user: apiUser } = await loginApi(email, pwd);
-      localStorage.setItem('access_token', token);
-      setUser(apiUser);
-    } catch (err) {
-      // Fallback to mock data if API is unreachable
-      console.warn('API login failed, using mock data:', err);
-      const mockUser = Object.values(MOCK_USERS).find(u => u.email === email) ??
-        MOCK_USERS[emailOrRole as keyof typeof MOCK_USERS] ??
-        MOCK_USERS.manager;
-      setUser(mockUser);
-    }
+    const { token, user: apiUser } = await loginApi(email, pwd);
+    localStorage.setItem('access_token', token);
+    setUser(apiUser);
+    return apiUser;
   };
 
   const logout = () => {
