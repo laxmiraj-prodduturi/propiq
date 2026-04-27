@@ -7,9 +7,9 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
     AI_SERVICE_URL: str = "http://localhost:8100"
-    AI_SERVICE_TIMEOUT_SECONDS: float = 8.0
+    AI_SERVICE_TIMEOUT_SECONDS: float = 60.0
 
-    model_config = {"env_file": ".env"}
+    model_config = {"env_file": ".env", "extra": "ignore"}
 
 
 settings = Settings()

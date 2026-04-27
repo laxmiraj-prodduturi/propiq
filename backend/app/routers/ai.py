@@ -299,38 +299,7 @@ def chat_history(
 
 
 # ---------------------------------------------------------------------------
-# Resume — continue the paused LangGraph
-# ---------------------------------------------------------------------------
-
-@router.post("/resume/{action_id}", response_model=AIChatResponse)
-def resume_action(
-    action_id: str,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    approval = db.query(AIApproval).filter(
-        AIApproval.action_id == action_id,
-        AIApproval.user_id == current_user.id,
-    ).first()
-    if not approval:
-        raise HTTPException(status_code=404, detail="Approval request not found")
-
-    if approval.status == "pending":
-        raise HTTPException(status_code=409, detail="Action has not been approved or rejected yet")
-
-    try:
-        proxy_response = _proxy_request(f"/resume/{action_id}", method="POST", user=current_user)
-        validated = AIChatResponse.model_validate(proxy_response)
-        # Persist the follow-up message
-        _save_message(db, session_id=approval.session_id, msg=validated.message)
-        db.commit()
-        return validated
-    except (error.URLError, error.HTTPError, TimeoutError, ValueError) as exc:
-        raise HTTPException(status_code=502, detail="AI service unavailable") from exc
-
-
-# ---------------------------------------------------------------------------
-# Approve
+# Approve — proxies to AI service which generates confirmation inline
 # ---------------------------------------------------------------------------
 
 @router.post("/approve/{action_id}", response_model=AIApprovalResponse)
@@ -340,38 +309,28 @@ def approve_action(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    # Try AI service first
     try:
         proxy_response = _proxy_request(
             f"/approve/{action_id}?{parse.urlencode({'approved': approved})}",
             method="POST",
             user=current_user,
         )
-        # Also update DB record
+        validated = AIApprovalResponse.model_validate(proxy_response)
+
+        # Update DB record
         approval = db.query(AIApproval).filter(AIApproval.action_id == action_id).first()
         if approval:
             approval.status = "approved" if approved else "rejected"
             approval.approver_user_id = current_user.id
             approval.resolved_at = _now()
+            # Save follow-up confirmation message into the session
+            if validated.follow_up and approval.session_id:
+                _save_message(db, session_id=approval.session_id, msg=validated.follow_up)
             db.commit()
-        return AIApprovalResponse.model_validate(proxy_response)
-    except (error.URLError, error.HTTPError, TimeoutError, ValueError):
-        pass
 
-    # Fallback: update DB only
-    approval = db.query(AIApproval).filter(AIApproval.action_id == action_id).first()
-    if not approval or approval.user_id != current_user.id:
-        raise HTTPException(status_code=404, detail="Approval request not found")
-    if current_user.role not in {"owner", "manager"}:
-        raise HTTPException(status_code=403, detail="Approval not permitted for this role")
-
-    approval.status = "approved" if approved else "rejected"
-    approval.approver_user_id = current_user.id
-    approval.resolved_at = _now()
-    db.commit()
-
-    message = "Action approved." if approved else "Action rejected."
-    return AIApprovalResponse(action_id=action_id, status=approval.status, message=message)
+        return validated
+    except (error.URLError, error.HTTPError, TimeoutError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="AI service unavailable") from exc
 
 
 # ---------------------------------------------------------------------------

@@ -47,6 +47,7 @@ class AIApprovalResponse(BaseModel):
     action_id: str
     status: Literal["approved", "rejected"]
     message: str
+    follow_up: "AIMessageOut | None" = None
 
 
 class UserContext(BaseModel):

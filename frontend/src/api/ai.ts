@@ -60,7 +60,7 @@ export async function sendAIChatMessage(message: string, sessionId?: string): Pr
   };
 }
 
-export async function approveAIAction(actionId: string, approved: boolean): Promise<{ actionId: string; status: 'approved' | 'rejected'; message: string }> {
+export async function approveAIAction(actionId: string, approved: boolean): Promise<{ actionId: string; status: 'approved' | 'rejected'; message: string; followUp?: AIMessage }> {
   const raw = await apiRequest<any>(`/ai/approve/${actionId}?approved=${approved}`, {
     method: 'POST',
   });
@@ -69,16 +69,6 @@ export async function approveAIAction(actionId: string, approved: boolean): Prom
     actionId: raw.action_id,
     status: raw.status,
     message: raw.message,
-  };
-}
-
-export async function resumeAIAction(actionId: string): Promise<{ sessionId: string; message: AIMessage }> {
-  const raw = await apiRequest<any>(`/ai/resume/${actionId}`, {
-    method: 'POST',
-  });
-
-  return {
-    sessionId: raw.session_id,
-    message: mapMessage(raw.message),
+    followUp: raw.follow_up ? mapMessage(raw.follow_up) : undefined,
   };
 }

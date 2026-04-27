@@ -1,246 +1,232 @@
 from __future__ import annotations
 
+import contextvars
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
-from langgraph.checkpoint.memory import MemorySaver
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 
+from .agents.orchestrator import ORCHESTRATOR_TOOLS, get_orchestrator_prompt
+from .checkpointer import get_checkpointer
+from .config import settings
+from .logging_config import get_logger
 from .schemas import AIActionCard, AIDebugInfo, AIMessageOut, ProposedAction, UserContext
-from .services import tools
-from .services.data_access import (
-    get_active_leases,
-    get_expiring_leases,
-    get_open_maintenance,
-    get_payment_history,
-    list_properties,
-    list_tenants,
-    summarize_expiring_leases,
-    summarize_leases,
-    summarize_maintenance,
-    summarize_payments,
-    summarize_property_portfolio,
-    summarize_tenants,
-)
-from .services.openai_client import classify_intent, compose_answer
-from .services.rag import init_vector_store, retrieve_documents
+from .services.agent_tools import set_user_context
+from .services.rag import init_vector_store
 from .state import AgentState
 
+logger = get_logger("graph")
+
 
 # ---------------------------------------------------------------------------
-# Node functions — each returns a partial-state dict
+# LLM factory
 # ---------------------------------------------------------------------------
 
-def intake_node(_state: AgentState) -> dict:
-    return {"debug_steps": ["intake"]}
+def _get_llm():
+    if not settings.OPENAI_API_KEY:
+        return None
+    llm = ChatOpenAI(
+        model=settings.OPENAI_MODEL,
+        temperature=0.3,
+        api_key=settings.OPENAI_API_KEY,
+    )
+    return llm.bind_tools(ORCHESTRATOR_TOOLS)
 
 
-def route_intent_node(state: AgentState) -> dict:
-    intent = classify_intent(state["user_message"], state["role"])
-    return {"intent": intent, "debug_steps": ["route_intent"]}
+# ---------------------------------------------------------------------------
+# Node: orchestrator agent — routes to specialists, synthesizes answer
+# ---------------------------------------------------------------------------
 
+def agent_node(state: AgentState) -> dict:
+    updates: dict = {"debug_steps": ["orchestrator"]}
 
-def retrieve_context_node(state: AgentState) -> dict:
-    user = UserContext(user_id=state["user_id"], role=state["role"], tenant_id=state["tenant_id"])
-    retrieved = retrieve_documents(state["user_message"], user)
-    return {
-        "retrieved_docs": [doc.model_dump() for doc in retrieved],
-        "citations": [doc.title for doc in retrieved],
-        "debug_steps": ["retrieve_context"],
-    }
+    llm = _get_llm()
+    if not llm:
+        updates["messages"] = [
+            AIMessage(content="OpenAI is not configured. Please set OPENAI_API_KEY in the .env file.")
+        ]
+        return updates
 
+    system = SystemMessage(content=get_orchestrator_prompt(state["role"]))
+    response = llm.invoke([system] + state["messages"])
+    updates["messages"] = [response]
+    logger.info("response", response)
+    # Detect propose_action inside any specialist's result → HITL
+    if hasattr(response, "tool_calls"):
+        for tc in response.tool_calls:
+            # The orchestrator itself can also trigger approval directly
+            if tc["name"] == "propose_action" and state["role"] in {"owner", "manager"}:
+                action = ProposedAction(
+                    action_id=f"act_{uuid.uuid4().hex[:10]}",
+                    type="approve_agent_action",
+                    title=tc["args"].get("title", "Proposed Action"),
+                    description=tc["args"].get("description", ""),
+                )
+                updates["approval_required"] = True
+                updates["proposed_actions"] = [action.model_dump()]
 
-def plan_node(state: AgentState) -> dict:
-    updates: dict = {"debug_steps": ["plan"]}
-    if state["intent"] == "maintenance_workflow" and state["role"] in {"owner", "manager"}:
-        action = ProposedAction(
-            action_id=f"act_{uuid.uuid4().hex[:10]}",
-            type="approve_maintenance_followup",
-            title="Approve Maintenance Follow-up",
-            description=(
-                "Authorize a resident update and vendor dispatch plan. "
-                "Review the open maintenance requests above before approving."
-            ),
-        )
-        updates["approval_required"] = True
-        updates["proposed_actions"] = [action.model_dump()]
     return updates
 
 
 # ---------------------------------------------------------------------------
-# Intent handlers — one function per intent
-# Adding a new intent = add a handler here + an entry in _INTENT_HANDLERS below
+# Node: approval gate — generates follow-up after human decision
 # ---------------------------------------------------------------------------
-
-def _handle_portfolio_summary(state: AgentState, user: UserContext) -> tuple[dict, list[dict]]:
-    properties = list_properties(user)
-    maintenance_items = get_open_maintenance(user)
-    payments = get_payment_history(user)
-    leases = get_active_leases(user)
-    filtered_props = tools.filter_records_by_query(
-        properties, state["user_message"], ["address", "city", "name", "status"]
-    )
-    prop_summary = summarize_property_portfolio(filtered_props)
-    maint_summary = summarize_maintenance(maintenance_items)
-    pay_summary = summarize_payments(payments, leases, state["role"])
-    return (
-        {"summary": " ".join([prop_summary, maint_summary, pay_summary])},
-        [
-            {"name": "list_properties", "input": {}, "output_summary": prop_summary},
-            {"name": "get_open_maintenance", "input": {}, "output_summary": maint_summary},
-            {"name": "get_payment_history", "input": {}, "output_summary": pay_summary},
-        ],
-    )
-
-
-def _handle_payment_workflow(state: AgentState, user: UserContext) -> tuple[dict, list[dict]]:
-    leases = get_active_leases(user)
-    payments = get_payment_history(user)
-    filtered_pays = tools.filter_records_by_query(
-        payments, state["user_message"], ["property_name", "tenant_name", "status", "due_date"]
-    )
-    pay_summary = summarize_payments(filtered_pays, leases, state["role"])
-    lease_summary = summarize_leases(leases)
-    return (
-        {"summary": " ".join([pay_summary, lease_summary])},
-        [
-            {"name": "get_payment_history", "input": {"role": state["role"]}, "output_summary": pay_summary},
-            {"name": "get_active_leases", "input": {}, "output_summary": lease_summary},
-        ],
-    )
-
-
-def _handle_maintenance_workflow(state: AgentState, user: UserContext) -> tuple[dict, list[dict]]:
-    requests = get_open_maintenance(user)
-    properties = list_properties(user)
-    filtered_reqs = tools.filter_records_by_query(
-        requests, state["user_message"], ["property_name", "category", "description", "urgency", "status"]
-    )
-    maint_summary = summarize_maintenance(filtered_reqs)
-    prop_summary = summarize_property_portfolio(properties)
-    return (
-        {"summary": " ".join([maint_summary, prop_summary])},
-        [
-            {"name": "get_open_maintenance", "input": {}, "output_summary": maint_summary},
-            {"name": "list_properties", "input": {}, "output_summary": prop_summary},
-        ],
-    )
-
-
-def _handle_tenant_directory(state: AgentState, user: UserContext) -> tuple[dict, list[dict]]:
-    tenants = list_tenants(user)
-    tenant_summary = summarize_tenants(tenants, state["role"])
-    return (
-        {"summary": tenant_summary},
-        [{"name": "list_tenants", "input": {}, "output_summary": tenant_summary}],
-    )
-
-
-def _handle_lease_workflow(state: AgentState, user: UserContext) -> tuple[dict, list[dict]]:
-    msg_lower = state["user_message"].lower()
-    days = 30 if any(t in msg_lower for t in ("month", "30 day")) else 90
-    expiring = get_expiring_leases(user, days=days)
-    all_leases = get_active_leases(user)
-    expiry_summary = summarize_expiring_leases(expiring, days=days)
-    lease_summary = summarize_leases(all_leases)
-    return (
-        {"summary": "\n".join([expiry_summary, lease_summary])},
-        [
-            {"name": "get_expiring_leases", "input": {"days": days}, "output_summary": expiry_summary},
-            {"name": "get_active_leases", "input": {}, "output_summary": lease_summary},
-        ],
-    )
-
-
-def _handle_document_lookup(state: AgentState, user: UserContext) -> tuple[dict, list[dict]]:
-    leases = get_active_leases(user)
-    doc_summary = " ".join(d.get("snippet", "") for d in state["retrieved_docs"])
-    lease_summary = summarize_leases(leases)
-    parts = [p for p in [doc_summary, lease_summary] if p]
-    tool_calls: list[dict] = []
-    if state["retrieved_docs"]:
-        tool_calls.append({"name": "search_documents", "input": {"query": state["user_message"]}, "output_summary": doc_summary})
-    if leases:
-        tool_calls.append({"name": "get_active_leases", "input": {}, "output_summary": lease_summary})
-    return (
-        {"summary": " ".join(parts) if parts else "No matching records found."},
-        tool_calls,
-    )
-
-
-# Maps intent name → handler. Add one line here when adding a new intent.
-_INTENT_HANDLERS = {
-    "portfolio_summary":   _handle_portfolio_summary,
-    "payment_workflow":    _handle_payment_workflow,
-    "maintenance_workflow": _handle_maintenance_workflow,
-    "tenant_directory":    _handle_tenant_directory,
-    "lease_workflow":      _handle_lease_workflow,
-    "document_lookup":     _handle_document_lookup,
-    "general_qa":          _handle_document_lookup,  # same retrieval path
-}
-
-
-def tool_execution_node(state: AgentState) -> dict:
-    user = UserContext(user_id=state["user_id"], role=state["role"], tenant_id=state["tenant_id"])
-    handler = _INTENT_HANDLERS.get(state["intent"], _handle_document_lookup)
-    structured, new_tool_calls = handler(state, user)
-    return {
-        "structured_context": structured,
-        "tool_calls": new_tool_calls,
-        "debug_steps": ["tool_execution"],
-    }
-
-
-def policy_check_node(state: AgentState) -> dict:
-    updates: dict = {"debug_steps": ["policy_check"]}
-    if state.get("approval_required") and state["role"] not in {"owner", "manager"}:
-        updates["approval_required"] = False
-        updates["proposed_actions"] = []
-    return updates
-
-
-def respond_node(state: AgentState) -> dict:
-    tool_summary = ""
-    if state["tool_calls"]:
-        names = ", ".join(call["name"] for call in state["tool_calls"])
-        tool_summary = f"Tools used: {names}."
-
-    answer = compose_answer(
-        role=state["role"],
-        user_message=state["user_message"],
-        context_summary=state["structured_context"].get("summary", ""),
-        citations=state["citations"],
-        tool_summary=tool_summary,
-    )
-    return {"final_response": answer, "debug_steps": ["respond"]}
-
 
 def approval_gate_node(state: AgentState) -> dict:
-    """Runs after the user approves or rejects the proposed action."""
-    tool_summary = ""
-    if state["tool_calls"]:
-        names = ", ".join(call["name"] for call in state["tool_calls"])
-        tool_summary = f"Tools used: {names}."
+    updates: dict = {"debug_steps": ["approval_gate"]}
+    approval_status = state.get("approval_status", "pending")
+    proposed = state.get("proposed_actions", [])
+    action = proposed[0] if proposed else {}
 
-    answer = compose_answer(
-        role=state["role"],
-        user_message=state["user_message"],
-        context_summary=state["structured_context"].get("summary", ""),
-        citations=state["citations"],
-        tool_summary=tool_summary,
-        approval_status=state.get("approval_status"),
-    )
-    return {"final_response": answer, "debug_steps": ["approval_gate"]}
+    # Execute real post-approval side-effects
+    post_actions: list[str] = []
+    if approval_status == "approved" and action:
+        post_actions = _run_post_approval_actions(action, state)
+
+    llm = _get_llm()
+    if llm:
+        if approval_status == "approved":
+            instruction = (
+                f"The action '{action.get('title', 'the requested action')}' was APPROVED.\n"
+                + (f"Post-approval steps completed:\n" + "\n".join(f"- {s}" for s in post_actions) if post_actions else "")
+                + "\n\nGenerate a professional dispatch confirmation that includes:\n"
+                "1. What was dispatched and to which property\n"
+                "2. Vendor name, trade, and expected response window\n"
+                "3. What the tenant should expect (notification sent, technician incoming)\n"
+                "4. Work order reference or tracking context\n"
+                "5. Suggested next step for the manager (e.g. follow up in X hours if no vendor contact)"
+            )
+        else:
+            instruction = (
+                f"The action '{action.get('title', 'the requested action')}' was REJECTED.\n"
+                "Acknowledge the rejection professionally, summarize what will NOT happen, "
+                "and suggest alternative next steps the manager could take."
+            )
+
+        system = SystemMessage(content=get_orchestrator_prompt(state["role"]))
+        note = HumanMessage(content=instruction)
+        response = llm.invoke([system] + state["messages"] + [note])
+        updates["messages"] = [response]
+    else:
+        text = (
+            f"Dispatch confirmed. {' | '.join(post_actions)}"
+            if approval_status == "approved"
+            else "Action rejected. No changes have been made."
+        )
+        updates["messages"] = [AIMessage(content=text)]
+
+    return updates
+
+
+def _run_post_approval_actions(action: dict, state: AgentState) -> list[str]:
+    """
+    Execute real side-effects when an action is approved:
+    - Send in-app notification to all tenants on the affected property
+    - Send confirmation notification to the approver
+    Returns a list of human-readable completion summaries.
+    """
+    from .backend_bridge import send_notification, tenants_for_user
+
+    completed: list[str] = []
+    title = action.get("title", "Maintenance action")
+    description = action.get("description", "")
+
+    # Notify tenants on the property about incoming work
+    try:
+        tenants = tenants_for_user(
+            user_id=state["user_id"],
+            role=state["role"],
+            tenant_id=state["tenant_id"],
+        )
+        for tenant in tenants:
+            send_notification(
+                user_id=tenant.id,
+                type="maintenance",
+                title=f"Maintenance Scheduled: {title}",
+                body=(
+                    f"A technician has been dispatched to your property. {description} "
+                    "Please ensure access is available. Contact your property manager with any questions."
+                ),
+            )
+        if tenants:
+            completed.append(f"Tenant notification sent to {len(tenants)} resident(s)")
+    except Exception as exc:
+        completed.append(f"Tenant notification attempted (error: {exc})")
+
+    # Confirmation notification to the approver (manager/owner)
+    try:
+        send_notification(
+            user_id=state["user_id"],
+            type="ai",
+            title=f"Dispatch Confirmed: {title}",
+            body=f"You approved: {description} The vendor has been queued for dispatch.",
+        )
+        completed.append("Dispatch confirmation sent to your notifications")
+    except Exception:
+        pass
+
+    return completed
 
 
 # ---------------------------------------------------------------------------
 # Routing
 # ---------------------------------------------------------------------------
 
-def _route_after_respond(state: AgentState) -> str:
-    if state.get("approval_required"):
-        return "approval_gate"
+def _route_agent(state: AgentState) -> str:
+    last = state["messages"][-1]
+    if hasattr(last, "tool_calls") and last.tool_calls:
+        return "tools"
     return END
+
+
+
+# ---------------------------------------------------------------------------
+# Tool executor node — replaces ToolNode, executes all tool calls in the last message
+# ---------------------------------------------------------------------------
+
+_TOOL_MAP = {t.name: t for t in ORCHESTRATOR_TOOLS}
+logger.info("Registered orchestrator tools: %s", list(_TOOL_MAP))
+
+
+def tool_executor_node(state: AgentState) -> dict:
+    last = state["messages"][-1]
+    tool_calls = getattr(last, "tool_calls", [])
+    if not tool_calls:
+        return {"messages": [], "debug_steps": ["tools"]}
+
+    # Copy the current context so ContextVar values (user_ctx) propagate into threads
+    ctx = contextvars.copy_context()
+
+    def _invoke_one(tc: dict) -> tuple[dict, str]:
+        tool_fn = _TOOL_MAP.get(tc["name"])
+        logger.info("Tool call: %s | args: %s", tc["name"], tc["args"])
+        if tool_fn:
+            try:
+                result = ctx.run(tool_fn.invoke, tc["args"])
+                logger.debug("Tool result [%s]: %s", tc["name"], str(result)[:300])
+            except Exception as exc:
+                logger.exception("Tool error [%s]: %s", tc["name"], exc)
+                result = f"Tool error ({tc['name']}): {exc}"
+        else:
+            result = f"Unknown tool: {tc['name']}"
+        return tc, str(result)
+
+    results: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=len(tool_calls)) as executor:
+        futures = {executor.submit(_invoke_one, tc): tc["id"] for tc in tool_calls}
+        for future in as_completed(futures):
+            tc, result = future.result()
+            results[tc["id"]] = result
+
+    # Preserve the original tool_call order in the output messages
+    tool_messages = [
+        ToolMessage(content=results[tc["id"]], tool_call_id=tc["id"], name=tc["name"])
+        for tc in tool_calls
+    ]
+    return {"messages": tool_messages, "debug_steps": ["tools"]}
 
 
 # ---------------------------------------------------------------------------
@@ -250,37 +236,22 @@ def _route_after_respond(state: AgentState) -> str:
 def _build_graph() -> StateGraph:
     workflow = StateGraph(AgentState)
 
-    workflow.add_node("intake", intake_node)
-    workflow.add_node("route_intent", route_intent_node)
-    workflow.add_node("retrieve_context", retrieve_context_node)
-    workflow.add_node("plan", plan_node)
-    workflow.add_node("tool_execution", tool_execution_node)
-    workflow.add_node("policy_check", policy_check_node)
-    workflow.add_node("respond", respond_node)
-    workflow.add_node("approval_gate", approval_gate_node)
+    workflow.add_node("agent", agent_node)
+    workflow.add_node("tools", tool_executor_node)
 
-    workflow.set_entry_point("intake")
-    workflow.add_edge("intake", "route_intent")
-    workflow.add_edge("route_intent", "retrieve_context")
-    workflow.add_edge("retrieve_context", "plan")
-    workflow.add_edge("plan", "tool_execution")
-    workflow.add_edge("tool_execution", "policy_check")
-    workflow.add_edge("policy_check", "respond")
+    workflow.set_entry_point("agent")
     workflow.add_conditional_edges(
-        "respond",
-        _route_after_respond,
-        {"approval_gate": "approval_gate", END: END},
+        "agent",
+        _route_agent,
+        {"tools": "tools", END: END},
     )
-    workflow.add_edge("approval_gate", END)
+    workflow.add_edge("tools", "agent")
 
     return workflow
 
 
-_checkpointer = MemorySaver()
-graph = _build_graph().compile(
-    checkpointer=_checkpointer,
-    interrupt_before=["approval_gate"],
-)
+_checkpointer = get_checkpointer()
+graph = _build_graph().compile(checkpointer=_checkpointer)
 
 
 # ---------------------------------------------------------------------------
@@ -288,32 +259,35 @@ graph = _build_graph().compile(
 # ---------------------------------------------------------------------------
 
 def run_agent_turn(
-    *, session_id: str, message: str, user: UserContext, turn_id: str
+    *,
+    session_id: str,
+    message: str,
+    user: UserContext,
+    turn_id: str,
+    history: list | None = None,
 ) -> tuple[dict, bool]:
     """
-    Execute a fresh agent turn.
-
+    Execute one agent turn. Pass history (list of HumanMessage/AIMessage) from
+    the session store so the agent maintains conversation continuity across turns.
     Returns (state_values, was_interrupted).
-    was_interrupted=True means the graph paused before approval_gate and is
-    waiting for the user to approve/reject the proposed action.
     """
     init_vector_store()
+    set_user_context(user)
+
+    # Build message list: prior conversation + new user message
+    prior = [m for m in (history or []) if getattr(m, "content", "")]
+    messages = prior + [HumanMessage(content=message)]
 
     initial_state: AgentState = {
         "session_id": session_id,
         "user_id": user.user_id,
         "role": user.role,
         "tenant_id": user.tenant_id,
-        "user_message": message,
-        "intent": "general_qa",
-        "retrieved_docs": [],
-        "structured_context": {},
-        "tool_calls": [],
-        "proposed_actions": [],
+        "messages": messages,
+        "citations": [],
         "approval_required": False,
         "approval_status": None,
-        "final_response": "",
-        "citations": [],
+        "proposed_actions": [],
         "debug_steps": [],
     }
 
@@ -326,12 +300,69 @@ def run_agent_turn(
     return dict(snapshot.values), was_interrupted
 
 
-def resume_agent_turn(*, turn_id: str, approval_status: str) -> dict:
+def generate_approval_confirmation(
+    *,
+    action: dict,
+    approval_status: str,
+    user_id: str,
+    role: str,
+    tenant_id: str,
+) -> str:
     """
-    Resume a paused graph after an approval decision.
+    Generate a post-approval confirmation message without needing the graph state.
+    Called directly from the /approve endpoint.
+    """
+    title = action.get("title", "the requested action")
 
-    Returns the updated state containing the follow-up final_response.
-    """
+    post_actions: list[str] = []
+    if approval_status == "approved":
+        post_actions = _run_post_approval_actions(
+            action,
+            {"user_id": user_id, "role": role, "tenant_id": tenant_id},
+        )
+
+    llm_obj = _get_llm()
+    if llm_obj:
+        from langchain_openai import ChatOpenAI
+        simple_llm = ChatOpenAI(
+            model=settings.OPENAI_MODEL,
+            temperature=0.3,
+            api_key=settings.OPENAI_API_KEY,
+        )
+        if approval_status == "approved":
+            prompt = (
+                f"The action '{title}' was APPROVED.\n"
+                + (f"Steps completed:\n" + "\n".join(f"- {s}" for s in post_actions) + "\n\n" if post_actions else "\n")
+                + "Generate a concise professional dispatch confirmation (3-4 sentences) covering:\n"
+                "1. What was dispatched and to which property\n"
+                "2. Expected vendor response window\n"
+                "3. What the tenant should expect\n"
+                "4. Suggested next step for the manager"
+            )
+        else:
+            prompt = (
+                f"The action '{title}' was REJECTED.\n"
+                "Acknowledge the rejection professionally in 2-3 sentences and suggest an alternative next step."
+            )
+        try:
+            resp = simple_llm.invoke([
+                SystemMessage(content="You are a professional property management assistant."),
+                HumanMessage(content=prompt),
+            ])
+            return resp.content
+        except Exception:
+            pass
+
+    if approval_status == "approved":
+        base = f"Dispatch confirmed for '{title}'."
+        if post_actions:
+            base += " " + " | ".join(post_actions) + "."
+        return base
+    return f"'{title}' was rejected. No changes have been made."
+
+
+def resume_agent_turn(*, turn_id: str, approval_status: str) -> dict:
+    """Resume a paused graph after an approval decision."""
     thread_config = {"configurable": {"thread_id": turn_id}}
     graph.update_state(thread_config, {"approval_status": approval_status})
 
@@ -342,30 +373,74 @@ def resume_agent_turn(*, turn_id: str, approval_status: str) -> dict:
 
 
 def build_assistant_message(state: dict) -> AIMessageOut:
+    messages = state.get("messages", [])
+
+    # Final answer = last AIMessage that has non-empty text content
+    # (prefer messages without pending tool_calls, but fall back to any with content)
+    final_content = ""
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and msg.content:
+            final_content = msg.content
+            break
+
+    # Which specialist agents were called
+    agents_called: list[str] = []
+    for msg in messages:
+        if isinstance(msg, AIMessage) and hasattr(msg, "tool_calls"):
+            for tc in msg.tool_calls:
+                agents_called.append(tc["name"])
+
+    # Citations from document agent tool outputs
+    citations: list[str] = []
+    for msg in messages:
+        if isinstance(msg, ToolMessage) and getattr(msg, "name", "") in (
+            "ask_document_agent", "search_documents"
+        ):
+            for line in msg.content.split("\n"):
+                if line.startswith("[") and "]:" in line:
+                    citations.append(line[1: line.index("]")])
+
     action_card = None
     proposed = state.get("proposed_actions", [])
-    if proposed and state.get("approval_required"):
-        proposal = proposed[0]
+    # Only show action card when approval is still pending (not yet decided)
+    if proposed and state.get("approval_required") and state.get("approval_status") is None:
+        p = proposed[0]
         action_card = AIActionCard(
-            action_id=proposal["action_id"],
-            type=proposal["type"],
-            title=proposal["title"],
-            description=proposal["description"],
+            action_id=p["action_id"],
+            type=p["type"],
+            title=p["title"],
+            description=p["description"],
             status="pending",
         )
 
     debug_info = AIDebugInfo(
-        intent=state.get("intent", ""),
-        tools_called=[c["name"] for c in state.get("tool_calls", [])],
-        citations=state.get("citations", []),
+        intent=_infer_intent(agents_called),
+        tools_called=agents_called,
+        citations=citations or state.get("citations", []),
         steps=state.get("debug_steps", []),
     )
 
     return AIMessageOut(
         id=f"msg_{uuid.uuid4().hex[:10]}",
         role="assistant",
-        content=state.get("final_response", ""),
+        content=final_content,
         created_at=datetime.now(timezone.utc),
         action_card=action_card,
         debug_info=debug_info,
     )
+
+
+def _infer_intent(agents_called: list[str]) -> str:
+    if "ask_portfolio_agent" in agents_called:
+        return "portfolio_summary"
+    if "ask_lease_agent" in agents_called:
+        return "lease_workflow"
+    if "ask_tenant_agent" in agents_called:
+        return "tenant_directory"
+    if "ask_finance_agent" in agents_called:
+        return "payment_workflow"
+    if "ask_maintenance_agent" in agents_called:
+        return "maintenance_workflow"
+    if "ask_document_agent" in agents_called:
+        return "document_lookup"
+    return "general_qa"

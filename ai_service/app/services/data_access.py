@@ -192,12 +192,23 @@ def summarize_payments(payments: list[dict[str, object]], leases: list[dict[str,
 
 def list_tenants(user: UserContext) -> list[dict[str, object]]:
     users = tenants_for_user(user_id=user.user_id, role=user.role, tenant_id=user.tenant_id)
+
+    # Build a map of tenant_user_id → property address via active leases
+    leases = leases_for_user(user_id=user.user_id, role=user.role, tenant_id=user.tenant_id)
+    properties = properties_for_user(user_id=user.user_id, role=user.role, tenant_id=user.tenant_id)
+    prop_map = {p.id: f"{p.address}, {p.city}" for p in properties}
+    tenant_property: dict[str, str] = {}
+    for lease in leases:
+        if lease.status == "active" and lease.tenant_user_id not in tenant_property:
+            tenant_property[lease.tenant_user_id] = prop_map.get(lease.property_id, "Unknown property")
+
     return [
         {
             "id": u.id,
             "name": f"{u.first_name} {u.last_name}".strip(),
             "email": u.email,
             "phone": u.phone or "—",
+            "property": tenant_property.get(u.id, "No active lease"),
         }
         for u in users
     ]
@@ -209,7 +220,10 @@ def summarize_tenants(tenants: list[dict[str, object]], role: str) -> str:
     if role == "tenant":
         t = tenants[0]
         return f"Your contact on file: {t['name']}, {t['email']}, {t['phone']}."
-    lines = [f"  • {t['name']} — {t['phone']} — {t['email']}" for t in tenants]
+    lines = [
+        f"  • {t['name']} — {t['phone']} — {t['email']} — property: {t.get('property', '—')}"
+        for t in tenants
+    ]
     return f"{len(tenants)} tenant(s):\n" + "\n".join(lines)
 
 

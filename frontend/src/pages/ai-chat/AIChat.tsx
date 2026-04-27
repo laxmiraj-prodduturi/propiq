@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { approveAIAction, getAIChatHistory, resumeAIAction, sendAIChatMessage } from '../../api/ai';
+import { approveAIAction, getAIChatHistory, sendAIChatMessage } from '../../api/ai';
 import { useAuth } from '../../context/AuthContext';
 import type { AIDebugInfo, AIMessage, ActionCard } from '../../types';
 
@@ -180,18 +180,19 @@ export default function AIChat() {
     );
 
     try {
-      await approveAIAction(card.actionId, approved);
+      const result = await approveAIAction(card.actionId, approved);
 
-      if (approved) {
-        const resume = await resumeAIAction(card.actionId);
-        setMessages(prev => [...prev, resume.message]);
+      if (result.followUp) {
+        setMessages(prev => [...prev, result.followUp!]);
       } else {
         setMessages(prev => [
           ...prev,
           {
-            id: `rejection-${Date.now()}`,
-            role: 'assistant',
-            content: 'The action has been rejected. No changes will be made.',
+            id: `decision-${Date.now()}`,
+            role: 'assistant' as const,
+            content: approved
+              ? 'Action approved. The vendor has been notified.'
+              : 'Action rejected. No changes have been made.',
             createdAt: new Date().toISOString(),
           },
         ]);
@@ -201,7 +202,7 @@ export default function AIChat() {
         ...prev,
         {
           id: `approval-error-${Date.now()}`,
-          role: 'assistant',
+          role: 'assistant' as const,
           content: 'Could not process the approval. Please try again.',
           createdAt: new Date().toISOString(),
         },

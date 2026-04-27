@@ -5,10 +5,13 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, Header, HTTPException, Query
 
+from .logging_config import configure_logging, get_logger
+configure_logging()
+logger = get_logger("main")
+
 from .config import settings
-from .graph import build_assistant_message, resume_agent_turn, run_agent_turn
+from .graph import build_assistant_message, generate_approval_confirmation, run_agent_turn
 from .schemas import (
-    AIActionCard,
     AIApprovalResponse,
     AIChatHistoryResponse,
     AIChatRequest,
@@ -19,6 +22,7 @@ from .schemas import (
     UserContext,
 )
 from .services.openai_client import support_answer
+from .backend_bridge import messages_for_session as _db_messages
 from .store import (
     action_thread_map,
     approval_store,
@@ -86,28 +90,82 @@ def chat(
         created_at=_now(),
     )
 
-    state, was_interrupted = run_agent_turn(
+    # Guard: if this user already has a pending approval, don't re-run the agent.
+    # Typing "yes" / "approve" in the chat box while a card is waiting creates a loop.
+    _AFFIRMATIONS = {"yes", "yeah", "yep", "ok", "okay", "approve", "confirm", "go ahead", "sure", "do it"}
+    pending_action_id = next(
+        (aid for aid, info in approval_store.items()
+         if info.get("user_id") == user.user_id and info.get("status") == "pending"),
+        None,
+    )
+    if pending_action_id and payload.message.strip().lower() in _AFFIRMATIONS:
+        redirect = AIMessageOut(
+            id=f"msg_{uuid.uuid4().hex[:10]}",
+            role="assistant",
+            content=(
+                "It looks like there's already an action pending your approval above. "
+                "Please click the **Approve** or **Reject** button on the action card to proceed — "
+                "typing here won't trigger the approval."
+            ),
+            created_at=_now(),
+        )
+        session_store[session_id].extend([user_message, redirect])
+        session_owner[session_id] = user.user_id
+        user_last_session[user.user_id] = session_id
+        return AIChatResponse(session_id=session_id, message=redirect)
+    # Build conversation history so the agent maintains context across turns.
+    # If the in-memory store is empty (e.g. after a restart), seed it from MySQL.
+    from langchain_core.messages import AIMessage as LCAIMessage, HumanMessage as LCHumanMessage
+    if session_id not in session_store or not session_store[session_id]:
+        for row in _db_messages(session_id=session_id, limit=20):
+            session_store[session_id].append(
+                AIMessageOut(
+                    id=row["id"],
+                    role=row["role"],
+                    content=row["content"],
+                    created_at=row["created_at"],
+                )
+            )
+        if session_store[session_id]:
+            session_owner[session_id] = user.user_id
+            user_last_session[user.user_id] = session_id
+
+    history = []
+    for msg in session_store.get(session_id, [])[-20:]:
+        if msg.role == "user" and msg.content:
+            history.append(LCHumanMessage(content=msg.content))
+        elif msg.role == "assistant" and msg.content:
+            history.append(LCAIMessage(content=msg.content))
+
+    logger.info("Chat | user=%s role=%s session=%s msg=%.120s", user.user_id, user.role, session_id, payload.message)
+    state, _ = run_agent_turn(
         session_id=session_id,
         message=payload.message,
         user=user,
         turn_id=turn_id,
+        history=history,
     )
     assistant_message = build_assistant_message(state)
+    logger.info("Chat | reply=%.200s action_card=%s", assistant_message.content, bool(assistant_message.action_card))
 
-    # If the graph is waiting for approval, persist the turn_id so /resume can continue it
-    if was_interrupted and assistant_message.action_card:
+    # If agent proposed an action, store everything /approve needs to generate confirmation
+    if assistant_message.action_card:
         action_id = assistant_message.action_card.action_id
+        proposed = state.get("proposed_actions", [])
         approval_store[action_id] = {
             "status": "pending",
             "user_id": user.user_id,
-            "action_card": assistant_message.action_card,
+            "session_id": session_id,
+            "action_info": proposed[0] if proposed else {
+                "action_id": action_id,
+                "title": assistant_message.action_card.title,
+                "description": assistant_message.action_card.description,
+            },
         }
-        action_thread_map[action_id] = turn_id
 
     session_owner[session_id] = user.user_id
     user_last_session[user.user_id] = session_id
     session_store[session_id].extend([user_message, assistant_message])
-
     return AIChatResponse(session_id=session_id, message=assistant_message)
 
 
@@ -128,7 +186,15 @@ def chat_history(
         return AIChatHistoryResponse(session_id=None, messages=[])
 
     if session_owner.get(resolved_session_id) != user.user_id:
-        raise HTTPException(status_code=404, detail="Session not found")
+        # Not in memory — try MySQL before giving up
+        db_msgs = _db_messages(session_id=resolved_session_id, limit=40)
+        if not db_msgs:
+            raise HTTPException(status_code=404, detail="Session not found")
+        messages = [
+            AIMessageOut(id=r["id"], role=r["role"], content=r["content"], created_at=r["created_at"])
+            for r in db_msgs
+        ]
+        return AIChatHistoryResponse(session_id=resolved_session_id, messages=messages)
 
     return AIChatHistoryResponse(
         session_id=resolved_session_id,
@@ -137,7 +203,7 @@ def chat_history(
 
 
 # ---------------------------------------------------------------------------
-# Approve — record the decision (frontend renders the status update)
+# Approve — generates confirmation inline; no separate /resume needed
 # ---------------------------------------------------------------------------
 
 @app.post("/approve/{action_id}", response_model=AIApprovalResponse)
@@ -156,58 +222,40 @@ def approve_action(
     if user.role not in {"owner", "manager"}:
         raise HTTPException(status_code=403, detail="Approval not permitted for this role")
 
-    status = "approved" if approved else "rejected"
-    approval["status"] = status
-    action_card = approval.get("action_card")
-    if isinstance(action_card, AIActionCard):
-        approval["action_card"] = action_card.model_copy(update={"status": status})
+    approval_status = "approved" if approved else "rejected"
+    logger.info("Approve | action=%s user=%s status=%s", action_id, user.user_id, approval_status)
 
-    message = "Action approved. Call /resume/{action_id} to receive the follow-up." if approved else "Action rejected."
-    return AIApprovalResponse(action_id=action_id, status=status, message=message)
-
-
-# ---------------------------------------------------------------------------
-# Resume — continue the paused LangGraph and return the follow-up message
-# ---------------------------------------------------------------------------
-
-@app.post("/resume/{action_id}", response_model=AIChatResponse)
-def resume_action(
-    action_id: str,
-    x_user_id: str | None = Header(default=None),
-    x_user_role: str | None = Header(default=None),
-    x_tenant_id: str | None = Header(default=None),
-):
-    user = _require_user_context(x_user_id, x_user_role, x_tenant_id)
-
-    approval = approval_store.get(action_id)
-    if approval is None or approval.get("user_id") != user.user_id:
-        raise HTTPException(status_code=404, detail="Approval request not found")
-
-    approval_status = str(approval.get("status", "pending"))
-    if approval_status == "pending":
-        raise HTTPException(status_code=409, detail="Action has not been approved or rejected yet")
-
-    turn_id = action_thread_map.get(action_id)
-    if not turn_id:
-        raise HTTPException(status_code=404, detail="No paused graph found for this action")
-
-    state = resume_agent_turn(turn_id=turn_id, approval_status=approval_status)
+    # Generate confirmation message directly — no graph resumption needed
+    action_info = approval.get("action_info", {})
+    follow_up_content = generate_approval_confirmation(
+        action=action_info,
+        approval_status=approval_status,
+        user_id=user.user_id,
+        role=user.role,
+        tenant_id=user.tenant_id,
+    )
     follow_up = AIMessageOut(
         id=f"msg_{uuid.uuid4().hex[:10]}",
         role="assistant",
-        content=state.get("final_response", ""),
+        content=follow_up_content,
         created_at=_now(),
     )
 
-    # Store in the original session so history reflects the full conversation
-    session_id = state.get("session_id", "")
+    # Persist the confirmation into the session history
+    session_id = approval.get("session_id", "")
     if session_id:
         session_store[session_id].append(follow_up)
 
-    # Clean up — action is now consumed
+    # Clean up — action is consumed
+    approval_store.pop(action_id, None)
     action_thread_map.pop(action_id, None)
 
-    return AIChatResponse(session_id=session_id, message=follow_up)
+    return AIApprovalResponse(
+        action_id=action_id,
+        status=approval_status,
+        message="Action processed.",
+        follow_up=follow_up,
+    )
 
 
 # ---------------------------------------------------------------------------

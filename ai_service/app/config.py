@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     DEMO_MODE: bool = True
     CHROMA_DB_PATH: str = str(Path(__file__).parent.parent / "chroma_db")
 
-    model_config = {"env_file": ".env"}
+    model_config = {"env_file": ".env", "extra": "ignore"}
 
 
 settings = Settings()

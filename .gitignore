@@ -27,6 +27,7 @@ dev-up.sh
 # ── AWS / SSH credentials ──────────────────────────────────────────────────────
 *.pem
 scripts/.ec2-state
+scripts/.ec2-state.bak
 
 # ── Real tenant documents (PII) ───────────────────────────────────────────────
 documents/leases/
@@ -37,6 +38,14 @@ scripts/seed_properties.sql
 
 # ── AI / Vector DB ────────────────────────────────────────────────────────────
 ai_service/chroma_db/
+
+# ── AI runtime state (ephemeral, contains session/action data) ─────────────────
+ai_service/agent_memory.db
+ai_service/agent_memory.db-shm
+ai_service/agent_memory.db-wal
+ai_service/action_thread_map.json
+ai_service/approval_store.json
+ai_service/logs/
 
 # ── OS ────────────────────────────────────────────────────────────────────────
 .DS_Store
