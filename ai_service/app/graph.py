@@ -6,34 +6,22 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 
 from .agents.orchestrator import ORCHESTRATOR_TOOLS, get_orchestrator_prompt
 from .checkpointer import get_checkpointer
-from .config import settings
 from .logging_config import get_logger
 from .schemas import AIActionCard, AIDebugInfo, AIMessageOut, ProposedAction, UserContext
 from .services.agent_tools import set_user_context
+from .services.llm_factory import TEMP_BALANCED, build_llm
 from .services.rag import init_vector_store
 from .state import AgentState
 
 logger = get_logger("graph")
 
 
-# ---------------------------------------------------------------------------
-# LLM factory
-# ---------------------------------------------------------------------------
-
 def _get_llm():
-    if not settings.OPENAI_API_KEY:
-        return None
-    llm = ChatOpenAI(
-        model=settings.OPENAI_MODEL,
-        temperature=0.3,
-        api_key=settings.OPENAI_API_KEY,
-    )
-    return llm.bind_tools(ORCHESTRATOR_TOOLS)
+    return build_llm(temperature=TEMP_BALANCED, tools=ORCHESTRATOR_TOOLS)
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +41,6 @@ def agent_node(state: AgentState) -> dict:
     system = SystemMessage(content=get_orchestrator_prompt(state["role"]))
     response = llm.invoke([system] + state["messages"])
     updates["messages"] = [response]
-    logger.info("response", response)
     # Detect propose_action inside any specialist's result → HITL
     if hasattr(response, "tool_calls"):
         for tc in response.tool_calls:
@@ -321,14 +308,8 @@ def generate_approval_confirmation(
             {"user_id": user_id, "role": role, "tenant_id": tenant_id},
         )
 
-    llm_obj = _get_llm()
-    if llm_obj:
-        from langchain_openai import ChatOpenAI
-        simple_llm = ChatOpenAI(
-            model=settings.OPENAI_MODEL,
-            temperature=0.3,
-            api_key=settings.OPENAI_API_KEY,
-        )
+    simple_llm = build_llm(temperature=TEMP_BALANCED)
+    if simple_llm:
         if approval_status == "approved":
             prompt = (
                 f"The action '{title}' was APPROVED.\n"

@@ -3,11 +3,10 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool
-from langchain_openai import ChatOpenAI
 
-from ..config import settings
+from ..services.llm_factory import TEMP_PRECISE, build_llm
 
 logger = logging.getLogger(__name__)
 
@@ -23,11 +22,8 @@ def run_specialist(
     """
     Run a specialist mini-agent: LLM with bound tools in a ReAct loop.
     Returns a plain-text summary of findings.
-    Falls back to a no-LLM message if OpenAI is not configured.
+    Falls back to an error string if OpenAI is not configured.
     """
-    if not settings.OPENAI_API_KEY:
-        return f"[{name}] OpenAI not configured — cannot run specialist."
-
     # Append role context so specialist LLM scopes its answers correctly
     from ..services.agent_tools import _user_ctx
     user = _user_ctx.get()
@@ -40,31 +36,25 @@ def run_specialist(
         }.get(user.role, "")
         if user else ""
     )
-    full_prompt = system_prompt + role_note
+
+    llm = build_llm(temperature=TEMP_PRECISE, tools=tools)
+    if not llm:
+        return f"[{name}] OpenAI not configured — cannot run specialist."
+
+    tool_map = {t.name: t for t in tools}
+    messages: list[Any] = [
+        SystemMessage(content=system_prompt + role_note),
+        HumanMessage(content=query),
+    ]
 
     try:
-        llm = ChatOpenAI(
-            model=settings.OPENAI_MODEL,
-            temperature=0.2,
-            api_key=settings.OPENAI_API_KEY,
-        ).bind_tools(tools)
-
-        tool_map = {t.name: t for t in tools}
-        messages: list[Any] = [
-            SystemMessage(content=full_prompt),
-            HumanMessage(content=query),
-        ]
-
         for _ in range(max_iterations):
             response = llm.invoke(messages)
             messages.append(response)
 
             if not getattr(response, "tool_calls", None):
-                # No more tool calls — final answer ready
                 return response.content or f"[{name}] No response generated."
 
-            # Execute each tool call
-            from langchain_core.messages import ToolMessage
             for tc in response.tool_calls:
                 tool_fn = tool_map.get(tc["name"])
                 if tool_fn:
@@ -75,9 +65,7 @@ def run_specialist(
                 else:
                     result = f"Unknown tool: {tc['name']}"
 
-                messages.append(
-                    ToolMessage(content=str(result), tool_call_id=tc["id"])
-                )
+                messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
 
         return f"[{name}] Reached max iterations without a final answer."
 
