@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..models.user import User
+from ..config import settings
 from ..schemas.auth import LoginRequest, RegisterRequest
 from ..schemas.user import LoginResponse, UserOut
 from ..services.auth import (
@@ -17,7 +18,7 @@ from ..services.auth import (
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 _REFRESH_COOKIE = "refresh_token"
-_COOKIE_OPTS = dict(httponly=True, samesite="lax", secure=False, max_age=7 * 24 * 3600, path="/api/v1/auth")
+_COOKIE_OPTS = dict(httponly=True, samesite="lax", secure=settings.COOKIE_SECURE, max_age=7 * 24 * 3600, path="/api/v1/auth")
 
 
 def _token_payload(user: User) -> dict:
