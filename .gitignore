@@ -54,6 +54,9 @@ Thumbs.db
 # ── Claude Code local settings (may contain allowed-command history) ──────────
 .claude/
 
+# ── Personal / local-only notes ───────────────────────────────────────────────
+INTERVIEW_PREP.md
+
 # ── IDE ───────────────────────────────────────────────────────────────────────
 .idea/
 .vscode/
